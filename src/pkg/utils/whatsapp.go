@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"mime"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -22,6 +23,70 @@ import (
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"go.mau.fi/whatsmeow"
 )
+
+var knownDocumentMIMEByExtension = map[string]string{
+	".doc":  "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":  "application/vnd.ms-excel",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":  "application/vnd.ms-powerpoint",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+var knownDocumentExtensionByMIME map[string]string
+
+func init() {
+	knownDocumentExtensionByMIME = make(map[string]string, len(knownDocumentMIMEByExtension))
+	for ext, mimeType := range knownDocumentMIMEByExtension {
+		knownDocumentExtensionByMIME[strings.ToLower(mimeType)] = ext
+	}
+}
+
+func resolveKnownDocumentMIME(ext string) (string, bool) {
+	ext = strings.ToLower(ext)
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+	mimeType, ok := knownDocumentMIMEByExtension[ext]
+	return mimeType, ok
+}
+
+func resolveKnownDocumentExtension(mimeType string) (string, bool) {
+	ext, ok := knownDocumentExtensionByMIME[strings.ToLower(mimeType)]
+	return ext, ok
+}
+
+// KnownDocumentMIMEByExtension returns a known MIME type for a given Office document extension.
+func KnownDocumentMIMEByExtension(ext string) (string, bool) {
+	return resolveKnownDocumentMIME(ext)
+}
+
+// KnownDocumentExtensionByMIME returns a known Office document extension for a given MIME type.
+func KnownDocumentExtensionByMIME(mimeType string) (string, bool) {
+	return resolveKnownDocumentExtension(mimeType)
+}
+
+func determineMediaExtension(originalFilename, mimeType string) string {
+	if originalFilename != "" {
+		if ext := filepath.Ext(originalFilename); ext != "" {
+			return ext
+		}
+	}
+
+	if ext, ok := resolveKnownDocumentExtension(mimeType); ok {
+		return ext
+	}
+
+	if ext, err := mime.ExtensionsByType(mimeType); err == nil && len(ext) > 0 {
+		return ext[0]
+	}
+
+	if parts := strings.Split(mimeType, "/"); len(parts) > 1 {
+		return "." + parts[len(parts)-1]
+	}
+
+	return ""
+}
 
 // ExtractMessageTextFromProto extracts text content from a WhatsApp proto message
 func ExtractMessageTextFromProto(msg *waE2E.Message) string {
@@ -167,14 +232,16 @@ func ExtractMessageTextFromEvent(evt *events.Message) string {
 			messageText = "📊 " + messageText
 		}
 	} else if pollMessageV4 := evt.Message.GetPollCreationMessageV4(); pollMessageV4 != nil {
-		messageText = pollMessageV4.GetMessage().GetConversation()
+		if pollMessage := pollMessageV4.GetMessage(); pollMessage != nil {
+			messageText = pollMessage.GetConversation()
+		}
 		if messageText == "" {
 			messageText = "📊 Poll"
 		} else {
 			messageText = "📊 " + messageText
 		}
 	} else if pollMessageV5 := evt.Message.GetPollCreationMessageV5(); pollMessageV5 != nil {
-		messageText = pollMessageV5.GetMessage().GetConversation()
+		messageText = pollMessageV5.GetName()
 		if messageText == "" {
 			messageText = "📊 Poll"
 		} else {
@@ -204,6 +271,14 @@ func ExtractMediaInfo(msg *waE2E.Message) (mediaType string, filename string, ur
 		return "video", filename,
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(),
 			vid.GetFileEncSHA256(), vid.GetFileLength()
+	}
+
+	// Check for PTV (video note) message - circular video messages
+	if ptv := msg.GetPtvMessage(); ptv != nil {
+		filename = GenerateMediaFilename("video_note", "mp4", ptv.GetCaption())
+		return "video_note", filename,
+			ptv.GetURL(), ptv.GetMediaKey(), ptv.GetFileSHA256(),
+			ptv.GetFileEncSHA256(), ptv.GetFileLength()
 	}
 
 	// Check for audio message
@@ -490,6 +565,8 @@ func ExtractMedia(ctx context.Context, client *whatsmeow.Client, storageLocation
 		return extractedMedia, fmt.Errorf("file size exceeds the maximum limit of %d bytes", maxFileSize)
 	}
 
+	var originalFilename string
+
 	switch media := mediaFile.(type) {
 	case *waE2E.ImageMessage:
 		extractedMedia.MimeType = media.GetMimetype()
@@ -504,14 +581,10 @@ func ExtractMedia(ctx context.Context, client *whatsmeow.Client, storageLocation
 	case *waE2E.DocumentMessage:
 		extractedMedia.MimeType = media.GetMimetype()
 		extractedMedia.Caption = media.GetCaption()
+		originalFilename = media.GetFileName()
 	}
 
-	var extension string
-	if ext, err := mime.ExtensionsByType(extractedMedia.MimeType); err == nil && len(ext) > 0 {
-		extension = ext[0]
-	} else if parts := strings.Split(extractedMedia.MimeType, "/"); len(parts) > 1 {
-		extension = "." + parts[len(parts)-1]
-	}
+	extension := determineMediaExtension(originalFilename, extractedMedia.MimeType)
 
 	extractedMedia.MediaPath = fmt.Sprintf("%s/%d-%s%s", storageLocation, time.Now().Unix(), uuid.NewString(), extension)
 	err = os.WriteFile(extractedMedia.MediaPath, data, 0600)
@@ -536,21 +609,45 @@ func SanitizePhone(phone *string) {
 
 // IsOnWhatsapp checks if a number is registered on WhatsApp
 func IsOnWhatsapp(client *whatsmeow.Client, jid string) bool {
-	// only check if the jid a user with @s.whatsapp.net
+	// only check if the jid is a user with @s.whatsapp.net
 	if strings.Contains(jid, "@s.whatsapp.net") {
-		data, err := client.IsOnWhatsApp([]string{jid})
+		// Extract phone number from JID and add + prefix for international format
+		phone := strings.TrimSuffix(jid, "@s.whatsapp.net")
+		if phone == "" {
+			return false
+		}
+
+		// whatsmeow expects international format with + prefix
+		if !strings.HasPrefix(phone, "+") {
+			phone = "+" + phone
+		}
+
+		// Add timeout to prevent indefinite blocking
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		data, err := client.IsOnWhatsApp(ctx, []string{phone})
 		if err != nil {
 			logrus.Error("Failed to check if user is on whatsapp: ", err)
 			return false
 		}
 
+		// Empty response means number not found/invalid
+		if len(data) == 0 {
+			return false
+		}
+
+		// Check if any result indicates the number is NOT on WhatsApp
 		for _, v := range data {
 			if !v.IsIn {
 				return false
 			}
 		}
+
+		return true
 	}
 
+	// For non-user JIDs (groups, newsletters), skip validation
 	return true
 }
 
@@ -558,11 +655,26 @@ func IsOnWhatsapp(client *whatsmeow.Client, jid string) bool {
 func ValidateJidWithLogin(client *whatsmeow.Client, jid string) (types.JID, error) {
 	MustLogin(client)
 
+	parsedJID, err := ParseJID(jid)
+	if err != nil {
+		return types.JID{}, err
+	}
+
+	// If it's an @lid JID, try to resolve to phone number
+	if parsedJID.Server == "lid" {
+		resolved := ResolveLIDToPhone(context.Background(), parsedJID, client)
+		if resolved.Server != "lid" {
+			parsedJID = resolved // Use resolved phone-based JID
+		}
+		// Skip IsOnWhatsapp check for LIDs
+		return parsedJID, nil
+	}
+
 	if config.WhatsappAccountValidation && !IsOnWhatsapp(client, jid) {
 		return types.JID{}, pkgError.InvalidJID(fmt.Sprintf("Phone %s is not on whatsapp", jid))
 	}
 
-	return ParseJID(jid)
+	return parsedJID, nil
 }
 
 // MustLogin ensures the WhatsApp client is logged in
@@ -575,6 +687,67 @@ func MustLogin(client *whatsmeow.Client) {
 	} else if !client.IsLoggedIn() {
 		panic(pkgError.ErrNotLoggedIn)
 	}
+}
+
+// ResolveLIDToPhone converts @lid JIDs to their corresponding @s.whatsapp.net JIDs
+// Returns the original JID if it's not an @lid or if LID lookup fails
+func ResolveLIDToPhone(ctx context.Context, jid types.JID, client *whatsmeow.Client) types.JID {
+	// Only process @lid JIDs
+	if jid.Server != "lid" {
+		return jid
+	}
+
+	// Safety check
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		logrus.Warnf("Cannot resolve LID %s: client not available", jid.String())
+		return jid
+	}
+
+	// Attempt to get the phone number for this LID
+	pn, err := client.Store.LIDs.GetPNForLID(ctx, jid)
+	if err != nil {
+		logrus.Debugf("Failed to resolve LID %s to phone number: %v", jid.String(), err)
+		return jid
+	}
+
+	// If we got a valid phone number, use it
+	if !pn.IsEmpty() {
+		logrus.Debugf("Resolved LID %s to phone number %s", jid.String(), pn.String())
+		return pn
+	}
+
+	// Fallback to original JID
+	return jid
+}
+
+// ResolvePhoneToLID converts @s.whatsapp.net JIDs to their corresponding @lid JIDs
+// Returns empty JID if it's not a user JID or if LID lookup fails
+func ResolvePhoneToLID(ctx context.Context, jid types.JID, client *whatsmeow.Client) types.JID {
+	// Only process user JIDs
+	if jid.Server != types.DefaultUserServer {
+		return types.JID{}
+	}
+
+	// Safety check
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		logrus.Debugf("Cannot resolve phone %s to LID: client not available", jid.String())
+		return types.JID{}
+	}
+
+	// Attempt to get the LID for this phone number
+	lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid)
+	if err != nil {
+		logrus.Debugf("Failed to resolve phone %s to LID: %v", jid.String(), err)
+		return types.JID{}
+	}
+
+	// If we got a valid LID, return it
+	if !lid.IsEmpty() {
+		logrus.Debugf("Resolved phone %s to LID %s", jid.String(), lid.String())
+		return lid
+	}
+
+	return types.JID{}
 }
 
 // Internal message types for event handling
@@ -600,16 +773,49 @@ func GetMessageDigestOrSignature(msg, key []byte) (string, error) {
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
+// UnwrapMessage unwraps FutureProof wrappers (ephemeral, view-once, etc.)
+// to access the inner message content. WhatsApp wraps messages in these
+// containers when disappearing messages or view-once is enabled.
+// The original message is not modified; the unwrapped inner message is returned.
+func UnwrapMessage(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return msg
+	}
+	inner := msg
+	for i := 0; i < 3; i++ { // safeguard against excessively nested wrappers
+		if vm := inner.GetViewOnceMessage(); vm != nil && vm.GetMessage() != nil {
+			inner = vm.GetMessage()
+			continue
+		}
+		if em := inner.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
+			inner = em.GetMessage()
+			continue
+		}
+		if vm2 := inner.GetViewOnceMessageV2(); vm2 != nil && vm2.GetMessage() != nil {
+			inner = vm2.GetMessage()
+			continue
+		}
+		if vm2e := inner.GetViewOnceMessageV2Extension(); vm2e != nil && vm2e.GetMessage() != nil {
+			inner = vm2e.GetMessage()
+			continue
+		}
+		break
+	}
+	return inner
+}
+
 // BuildEventMessage builds event message structure
 func BuildEventMessage(evt *events.Message) (message EvtMessage) {
-	message.Text = evt.Message.GetConversation()
+	msg := UnwrapMessage(evt.Message)
+
+	message.Text = msg.GetConversation()
 	message.ID = evt.Info.ID
 
-	if extendedMessage := evt.Message.GetExtendedTextMessage(); extendedMessage != nil {
+	if extendedMessage := msg.GetExtendedTextMessage(); extendedMessage != nil {
 		message.Text = extendedMessage.GetText()
 		message.RepliedId = extendedMessage.ContextInfo.GetStanzaID()
 		message.QuotedMessage = extendedMessage.ContextInfo.GetQuotedMessage().GetConversation()
-	} else if protocolMessage := evt.Message.GetProtocolMessage(); protocolMessage != nil {
+	} else if protocolMessage := msg.GetProtocolMessage(); protocolMessage != nil {
 		if editedMessage := protocolMessage.GetEditedMessage(); editedMessage != nil {
 			if extendedText := editedMessage.GetExtendedTextMessage(); extendedText != nil {
 				message.Text = extendedText.GetText()
@@ -622,20 +828,20 @@ func BuildEventMessage(evt *events.Message) (message EvtMessage) {
 	return message
 }
 
-// BuildEventReaction builds event reaction structure
 func BuildEventReaction(evt *events.Message) (waReaction EvtReaction) {
-	if reactionMessage := evt.Message.GetReactionMessage(); reactionMessage != nil {
+	msg := UnwrapMessage(evt.Message)
+	if reactionMessage := msg.GetReactionMessage(); reactionMessage != nil {
 		waReaction.Message = reactionMessage.GetText()
 		waReaction.ID = reactionMessage.GetKey().GetID()
 	}
 	return waReaction
 }
 
-// BuildForwarded checks if message is forwarded
 func BuildForwarded(evt *events.Message) bool {
-	if extendedText := evt.Message.GetExtendedTextMessage(); extendedText != nil {
+	msg := UnwrapMessage(evt.Message)
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
 		return extendedText.ContextInfo.GetIsForwarded()
-	} else if protocolMessage := evt.Message.GetProtocolMessage(); protocolMessage != nil {
+	} else if protocolMessage := msg.GetProtocolMessage(); protocolMessage != nil {
 		if editedMessage := protocolMessage.GetEditedMessage(); editedMessage != nil {
 			if extendedText := editedMessage.GetExtendedTextMessage(); extendedText != nil {
 				return extendedText.ContextInfo.GetIsForwarded()
